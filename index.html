@@ -3,37 +3,111 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AR 測量工具</title>
+  <title>WebXR AR 平面圖測量工具</title>
   <style>
-    /* 強制將頁面內所有未包裹的文字（即貼錯的原始碼文字）隱藏 */
-    body {
-      margin: 0;
-      overflow: hidden;
-      font-size: 0;
-      color: transparent;
-      background: #000;
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      overflow: hidden; background-color: #000; font-family: sans-serif;
+    }
+
+    /* 全螢幕 AR UI 圖層 */
+    #ui-layer {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; z-index: 9999;
+      display: flex; flex-direction: column; justify-content: space-between;
+    }
+
+    .info-box {
+      margin: 30px auto 0;
+      background: rgba(0, 0, 0, 0.8); color: #fff;
+      padding: 12px 24px; border-radius: 20px;
+      font-size: 15px; text-align: center; max-width: 85%;
+      pointer-events: auto;
+    }
+
+    .btn-box {
+      margin: 0 auto 40px;
+      display: flex; gap: 12px;
+      pointer-events: auto;
+    }
+
+    button {
+      padding: 14px 22px; font-size: 16px; font-weight: bold;
+      color: white; border: none; border-radius: 10px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.5);
     }
     
-    /* 保持正常控制 UI 顯示 */
-    #ui-layer {
-      position: absolute;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      pointer-events: none;
-      z-index: 9999;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      font-size: 16px;
-      color: #fff;
-    }
-    .info-box {
-      margin: 20px auto 0;
-      background: rgba(0, 0, 0, 0.7);
-      padding: 10px 20px;
-      border-radius: 20px;
+    #start-btn { background-color: #007bff; }
+    #add-btn { background-color: #28a745; display: none; }
+    #pdf-btn { background-color: #17a2b8; display: none; }
+    button:disabled { background-color: #6c757d; opacity: 0.5; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <div id="ui-layer">
+    <div id="info" class="info-box">請點擊下方「開啟 AR」按鈕</div>
+    <div class="btn-box">
+      <button id="start-btn">開啟 AR</button>
+      <button id="add-btn">紀錄牆角點</button>
+      <button id="pdf-btn" disabled>完成並匯出 PDF</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle;
+    let points = [];
+    let linesMesh;
+
+    const startBtn = document.getElementById('start-btn');
+    const addBtn = document.getElementById('add-btn');
+    const pdfBtn = document.getElementById('pdf-btn');
+    const info = document.getElementById('info');
+    const uiLayer = document.getElementById('ui-layer');
+
+    // 使用者點擊按鈕，符合 User Activation 規範
+    startBtn.addEventListener('click', async () => {
+      if (!navigator.xr) {
+        alert("此裝置或瀏覽器不支援 WebXR AR");
+        return;
+      }
+      try {
+        await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch (e) {}
+      initAR();
+    });
+
+    async function initAR() {
+      try {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+
+        // 綠色準心
+        const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        reticle = new THREE.Mesh(ringGeo, ringMat);
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        // 在 User Activation 事件處理內部請求 AR Session
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          required
       pointer-events: auto;
       text-align: center;
     }
