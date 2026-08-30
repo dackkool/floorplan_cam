@@ -3,37 +3,324 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WebXR AR 平面圖測量工具</title>
+  <title>AR 平面圖測量工具</title>
   <style>
-    * { box-sizing: border-box; }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    
     html, body {
-      margin: 0; padding: 0; width: 100%; height: 100%;
-      overflow: hidden; background-color: #000; font-family: sans-serif;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
 
-    /* 全螢幕 AR UI 圖層 */
-    #ui-layer {
-      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-      pointer-events: none; z-index: 9999;
-      display: flex; flex-direction: column; justify-content: space-between;
+    /* 浮動在 AR 相機畫面頂層的 UI 容器 */
+    #ui-container {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      pointer-events: none; /* 讓未點擊區域可透視到 3D 畫面 */
+      z-index: 99999;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: center;
+      padding: 20px 15px 40px 15px;
     }
 
-    .info-box {
-      margin: 30px auto 0;
-      background: rgba(0, 0, 0, 0.8); color: #fff;
-      padding: 12px 24px; border-radius: 20px;
-      font-size: 15px; text-align: center; max-width: 85%;
+    /* 頂部狀態提示框 */
+    #info {
+      background: rgba(0, 0, 0, 0.75);
+      color: #ffffff;
+      padding: 12px 20px;
+      border-radius: 25px;
+      font-size: 15px;
+      text-align: center;
+      max-width: 90%;
+      backdrop-filter: blur(4px);
+      pointer-events: auto;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+    }
+
+    /* 底部按鈕區域：橫向排列，加入間距防止重疊 */
+    #btn-group {
+      display: flex;
+      flex-direction: row;
+      justify-content: center;
+      align-items: center;
+      gap: 15px; /* 關鍵：強制間隔，絕不重疊 */
+      width: 100%;
+      max-width: 400px;
       pointer-events: auto;
     }
 
-    .btn-box {
-      margin: 0 auto 40px;
-      display: flex; gap: 12px;
-      pointer-events: auto;
+    /* 通用按鈕樣式 */
+    .btn {
+      flex: 1;
+      padding: 14px 10px;
+      font-size: 15px;
+      font-weight: bold;
+      color: #ffffff;
+      border: none;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.2s ease;
     }
 
-    button {
-      padding: 14px 22px; font-size: 16px; font-weight: bold;
+    .btn:active {
+      transform: scale(0.96);
+    }
+
+    /* 個別按鈕顏色與初始顯示狀態 */
+    #start-btn {
+      background-color: #007bff;
+      display: block;
+      max-width: 200px;
+    }
+
+    #add-btn {
+      background-color: #28a745;
+      display: none; /* 進入 AR 後才顯示 */
+    }
+
+    #pdf-btn {
+      background-color: #17a2b8;
+      display: none; /* 進入 AR 後才顯示 */
+    }
+
+    /* 禁用按鈕樣式 */
+    .btn:disabled {
+      background-color: #6c757d !important;
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
+  </style>
+
+  <!-- 引入 Three.js (3D 引擎) 與 jsPDF (PDF 匯出) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- AR 操作介面 -->
+  <div id="ui-container">
+    <div id="info">請點擊下方「開啟 AR」開始測量</div>
+    <div id="btn-group">
+      <button id="start-btn" class="btn">開啟 AR</button>
+      <button id="add-btn" class="btn">紀錄牆角點</button>
+      <button id="pdf-btn" class="btn" disabled>匯出 PDF</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle;
+    let points = [];
+    let linesMesh;
+
+    const startBtn = document.getElementById('start-btn');
+    const addBtn = document.getElementById('add-btn');
+    const pdfBtn = document.getElementById('pdf-btn');
+    const info = document.getElementById('info');
+    const uiContainer = document.getElementById('ui-container');
+
+    // 點擊「開啟 AR」按鈕
+    startBtn.addEventListener('click', async () => {
+      if (!navigator.xr) {
+        alert("此裝置或瀏覽器不支援 WebXR AR！請確保使用 Android Chrome。");
+        return;
+      }
+
+      // 步驟 1: 先明確申請相機權限
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // 取得權限後立即關閉臨時串流，交給 WebXR 接管
+        stream.getTracks().forEach(track => track.stop());
+      } catch (err) {
+        alert("權限取得失敗：請在瀏覽器網址列旁允許相機存取權限。");
+        info.innerText = "無法開啟相機權限";
+        return;
+      }
+
+      // 步驟 2: 啟動 WebXR AR Session
+      initAR();
+    });
+
+    async function initAR() {
+      try {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+
+        // 綠色準心 (瞄準地板牆角用)
+        const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        reticle = new THREE.Mesh(ringGeo, ringMat);
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        // 啟動 Immersive AR Session 並綁定 UI 圖層
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: uiContainer }
+        });
+
+        renderer.xr.setSession(session);
+
+        // 成功進入 AR 後切換按鈕
+        startBtn.style.display = 'none';
+        addBtn.style.display = 'block';
+        pdfBtn.style.display = 'block';
+        info.innerText = "請擺動手機掃描地面，瞄準第一個牆角按「紀錄牆角點」";
+
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+        xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+        renderer.setAnimationLoop(render);
+
+      } catch (error) {
+        alert("AR 啟動失敗: " + error.message);
+        info.innerText = "AR 啟動失敗: " + error.message;
+      }
+    }
+
+    // 每秒 60 幀渲染與地面偵測
+    function render(timestamp, frame) {
+      if (frame) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+
+          if (points.length > 0) {
+            const currentPos = new THREE.Vector3();
+            currentPos.setFromMatrixPosition(reticle.matrix);
+            const dist = currentPos.distanceTo(points[points.length - 1]);
+            info.innerText = `已記錄 ${points.length} 個點 | 與上點距離: ${dist.toFixed(2)}m`;
+          }
+        } else {
+          reticle.visible = false;
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 點擊「紀錄牆角點」
+    addBtn.addEventListener('click', () => {
+      if (reticle && reticle.visible) {
+        const position = new THREE.Vector3();
+        position.setFromMatrixPosition(reticle.matrix);
+        points.push(position);
+
+        if (points.length === 1) {
+          addBtn.innerText = "紀錄下一個點";
+        }
+
+        // 滿 3 個牆角即可啟用 PDF 匯出
+        if (points.length >= 3) {
+          pdfBtn.disabled = false;
+        }
+
+        update3DLines();
+      } else {
+        alert("未偵測到地面！請對著地板擺動手機掃描。");
+      }
+    });
+
+    // 實時繪製 3D 牆線
+    function update3DLines() {
+      if (linesMesh) scene.remove(linesMesh);
+      if (points.length < 2) return;
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 4 });
+      linesMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(linesMesh);
+    }
+
+    // 匯出 PDF 功能
+    pdfBtn.addEventListener('click', generatePDF);
+
+    function generatePDF() {
+      if (points.length < 3) return;
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      const points2D = points.map(p => ({ x: p.x, y: p.z }));
+
+      const minX = Math.min(...points2D.map(p => p.x));
+      const maxX = Math.max(...points2D.map(p => p.x));
+      const minY = Math.min(...points2D.map(p => p.y));
+      const maxY = Math.max(...points2D.map(p => p.y));
+
+      const roomWidth = Math.max(maxX - minX, 0.1);
+      const roomHeight = Math.max(maxY - minY, 0.1);
+
+      const margin = 25;
+      const pdfWidth = 210 - margin * 2;
+      const pdfHeight = 297 - margin * 2 - 40;
+
+      const scale = Math.min(pdfWidth / roomWidth, pdfHeight / roomHeight);
+
+      const toPDFX = (x) => margin + (x - minX) * scale + (pdfWidth - roomWidth * scale) / 2;
+      const toPDFY = (y) => 60 + (y - minY) * scale + (pdfHeight - roomHeight * scale) / 2;
+
+      doc.setFontSize(20);
+      doc.text("Floor Plan", 105, 25, { align: "center" });
+
+      doc.setLineWidth(1.0);
+      doc.setDrawColor(0, 0, 0);
+
+      const totalPoints = points2D.length;
+      for (let i = 0; i < totalPoints; i++) {
+        const p1 = points2D[i];
+        const p2 = points2D[(i + 1) % totalPoints];
+
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+
+        doc.line(x1, y1, x2, y2);
+
+        const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+
+        const midX = (x1 + x2) / 2;
+        const midY = (y1 + y2) / 2;
+
+        doc.setFontSize(9);
+        doc.setTextColor(200, 0, 0);
+        doc.text(`${dist.toFixed(2)}m`, midX, midY - 2, { align: "center" });
+      }
+
+      doc.save("floor_plan.pdf");
+    }
+  </script>
+</body>
+</html>
       color: white; border: none; border-radius: 10px;
       box-shadow: 0 4px 10px rgba(0,0,0,0.5);
     }
