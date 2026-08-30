@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebXR AR 平面圖測量工具</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #ui-container {
+      position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 10px; z-index: 10;
+    }
+    button {
+      padding: 12px 20px; font-size: 16px; font-weight: bold;
+      border: none; border-radius: 8px; background: #007bff; color: white;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+    }
+    button:disabled { background: #cccccc; }
+    #info {
+      position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.7); color: white; padding: 10px 20px;
+      border-radius: 20px; font-size: 14px; pointer-events: none; z-index: 10;
+    }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <div id="info">請點擊「開啟 AR」開始測量</div>
+  <div id="ui-container">
+    <button id="ar-btn">開啟 AR</button>
+    <button id="add-btn" disabled>記錄牆角點</button>
+    <button id="pdf-btn" disabled>完成並匯出 PDF</button>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle; // 準心
+    let points = []; // 儲存標記的 3D 座標
+    let linesMesh; // 3D 牆線
+    let isARSupported = false;
+
+    const arBtn = document.getElementById('ar-btn');
+    const addBtn = document.getElementById('add-btn');
+    const pdfBtn = document.getElementById('pdf-btn');
+    const info = document.getElementById('info');
+
+    // 檢查瀏覽器是否支援 WebXR AR
+    if ('xr' in navigator) {
+      navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+        isARSupported = supported;
+        if (!supported) info.innerText = "此裝置或瀏覽器不支援 WebXR AR";
+      });
+    } else {
+      info.innerText = "請使用 Android Chrome 瀏覽器";
+    }
+
+    arBtn.addEventListener('click', () => {
+      if (isARSupported) initAR();
+    });
+
+    async function initAR() {
+      // 1. 初始化 Three.js 場景
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // 光源
+      const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+      scene.add(light);
+
+      // 2. 建立瞄準準心 (Reticle)
+      const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+      const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+      reticle = new THREE.Mesh(ringGeo, ringMat);
+      reticle.matrixAutoUpdate = false;
+      reticle.visible = false;
+      scene.add(reticle);
+
+      // 3. 請求 AR Session
+      const session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['hit-test', 'local-floor']
+      });
+
+      renderer.xr.setSession(session);
+      arBtn.style.display = 'none';
+      addBtn.disabled = false;
+      info.innerText = "請移動手機掃描地面，並瞄準牆角按「記錄點」";
+
+      // 取得參考空間與 Hit Test 源（用於發射射線偵測地面）
+      const viewerSpace = await session.requestReferenceSpace('viewer');
+      hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+      xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+      // 渲染迴圈
+      renderer.setAnimationLoop(render);
+    }
+
+    function render(timestamp, frame) {
+      if (frame) {
+        // 執行 Hit Test，找出手機瞄準的地面的 3D 空間位置
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+        } else {
+          reticle.visible = false;
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 點擊「記錄點」按鈕
+    addBtn.addEventListener('click', () => {
+      if (reticle.visible) {
+        // 從準心矩陣提取 3D 座標 (X, Y, Z)
+        const position = new THREE.Vector3();
+        position.setFromMatrixPosition(reticle.matrix);
+        points.push(position);
+
+        info.innerText = `已記錄 ${points.length} 個牆角點`;
+        if (points.length >= 3) pdfBtn.disabled = false;
+
+        update3D lines();
+      } else {
+        alert("未偵測到地面，請移動手機重新瞄準");
+      }
+    });
+
+    // 在 AR 空間中繪製連結各牆角點的線條
+    function update3DLines() {
+      if (linesMesh) scene.remove(linesMesh);
+      if (points.length < 2) return;
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 3 });
+      linesMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(linesMesh);
+    }
+
+    // 點擊「完成並匯出 PDF」按鈕
+    pdfBtn.addEventListener('click', generatePDF);
+
+    function generatePDF() {
+      if (points.length < 3) return;
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      // 1. 將 3D 空間點轉換為 2D 平面座標 (取 X 與 Z 軸，忽略高低差 Y 軸)
+      const points2D = points.map(p => ({ x: p.x, y: p.z }));
+
+      // 2. 計算正規化與縮放，確保圖形置中顯示在 A4 紙上
+      const minX = Math.min(...points2D.map(p => p.x));
+      const maxX = Math.max(...points2D.map(p => p.x));
+      const minY = Math.min(...points2D.map(p => p.y));
+      const maxY = Math.max(...points2D.map(p => p.y));
+
+      const roomWidth = maxX - minX;
+      const roomHeight = maxY - minY;
+
+      const margin = 20;
+      const pdfWidth = 210 - margin * 2;
+      const pdfHeight = 297 - margin * 2 - 40; // 留出標題位置
+
+      const scale = Math.min(pdfWidth / roomWidth, pdfHeight / roomHeight);
+
+      // 畫布變換函數 (空間公尺 -> PDF mm)
+      const toPDFX = (x) => margin + (x - minX) * scale + (pdfWidth - roomWidth * scale) / 2;
+      const toPDFY = (y) => 50 + (y - minY) * scale + (pdfHeight - roomHeight * scale) / 2;
+
+      // 3. 繪製標題與資訊
+      doc.setFontSize(18);
+      doc.text("Floor Plan", 105, 20, { align: "center" });
+      doc.setFontSize(10);
+      doc.text(`Generated by WebXR AR Floor Plan Tool`, 105, 28, { align: "center" });
+
+      // 4. 在 PDF 上繪製平面圖牆線與標記長度
+      doc.setLineWidth(0.8);
+      doc.setDrawColor(0, 0, 0);
+
+      const totalPoints = points2D.length;
+      for (let i = 0; i < totalPoints; i++) {
+        const p1 = points2D[i];
+        const p2 = points2D[(i + 1) % totalPoints]; // 連回第一個點形成閉合迴路
+
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+
+        // 畫牆線
+        doc.line(x1, y1, x2, y2);
+
+        // 計算實際距離 (單位: 公尺)
+        const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+
+        // 標註長度在牆線中點
+        const midX = (x1 + x2) / 2;
+        const midY = (y1 + y2) / 2;
+
+        doc.setFontSize(8);
+        doc.setTextColor(200, 0, 0);
+        doc.text(`${dist.toFixed(2)}m`, midX, midY - 2, { align: "center" });
+      }
+
+      // 下載 PDF
+      doc.save("floor_plan.pdf");
+    }
+  </script>
+</body>
+</html>
