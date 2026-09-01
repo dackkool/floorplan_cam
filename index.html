@@ -11,29 +11,263 @@
       background-color: #000; font-family: -apple-system, sans-serif;
     }
 
-    #ui-container {
+    /* 頂層唯一 UI 容器 */
+    #overlay-ui {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       pointer-events: none; z-index: 99999;
       display: flex; flex-direction: column; justify-content: space-between;
-      align-items: center; padding: 20px 15px 40px 15px;
+      align-items: center; padding: 25px 15px 45px 15px;
     }
 
-    #info {
-      background: rgba(0, 0, 0, 0.75); color: #ffffff;
-      padding: 12px 20px; border-radius: 25px; font-size: 15px;
-      text-align: center; max-width: 90%; backdrop-filter: blur(4px);
+    #info-box {
+      background: rgba(0, 0, 0, 0.8); color: #ffffff;
+      padding: 12px 22px; border-radius: 25px; font-size: 15px;
+      text-align: center; max-width: 90%; backdrop-filter: blur(5px);
       pointer-events: auto; box-shadow: 0 4px 10px rgba(0,0,0,0.3);
     }
 
-    #btn-group {
+    #btn-container {
       display: flex; flex-direction: row; justify-content: center;
       align-items: center; gap: 15px; width: 100%; max-width: 400px;
       pointer-events: auto;
     }
 
-    .btn {
+    .action-btn {
       flex: 1; padding: 14px 10px; font-size: 15px; font-weight: bold;
       color: #ffffff; border: none; border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4); cursor: pointer; text-align: center;
+    }
+
+    #main-start-btn { background-color: #007bff; max-width: 220px; }
+    #main-add-btn { background-color: #28a745; display: none; }
+    #main-pdf-btn { background-color: #17a2b8; display: none; }
+    .action-btn:disabled { background-color: #6c757d !important; opacity: 0.5; cursor: not-allowed; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- 唯一的 Overlay UI 圖層 -->
+  <div id="overlay-ui">
+    <div id="info-box">請點擊下方「開啟 AR」開始測量</div>
+    <div id="btn-container">
+      <button id="main-start-btn" class="action-btn">開啟 AR</button>
+      <button id="main-add-btn" class="action-btn">紀錄牆角點</button>
+      <button id="main-pdf-btn" class="action-btn" disabled>匯出 PDF</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace, hitTestSource = null;
+    let reticle;
+    let points = [];
+    let linesMesh;
+
+    const startBtn = document.getElementById('main-start-btn');
+    const addBtn = document.getElementById('main-add-btn');
+    const pdfBtn = document.getElementById('main-pdf-btn');
+    const infoBox = document.getElementById('info-box');
+    const overlayUI = document.getElementById('overlay-ui');
+
+    startBtn.addEventListener('click', async () => {
+      if (!navigator.xr) {
+        alert("此裝置或瀏覽器不支援 WebXR AR！請使用 Android Chrome。");
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        stream.getTracks().forEach(track => track.stop());
+      } catch (err) {
+        alert("請允許相機權限以使用 AR 功能。");
+        return;
+      }
+      initAR();
+    });
+
+    async function initAR() {
+      try {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+
+        // 準心
+        const ringGeo = new THREE.RingGeometry(0.04, 0.05, 32).rotateX(-Math.PI / 2);
+        const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        reticle = new THREE.Mesh(ringGeo, ringMat);
+        reticle.matrixAutoUpdate = false;
+        reticle.visible = false;
+        scene.add(reticle);
+
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test', 'local-floor'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: overlayUI }
+        });
+
+        renderer.xr.setSession(session);
+
+        // 按鈕切換：只留「紀錄牆角點」與「匯出 PDF」
+        startBtn.style.display = 'none';
+        addBtn.style.display = 'block';
+        pdfBtn.style.display = 'block';
+        infoBox.innerText = "請擺動手機掃描地面，瞄準牆角按「紀錄牆角點」";
+
+        const viewerSpace = await session.requestReferenceSpace('viewer');
+        hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+        xrRefSpace = await session.requestReferenceSpace('local-floor');
+
+        renderer.setAnimationLoop(render);
+
+      } catch (error) {
+        alert("AR 啟動失敗: " + error.message);
+      }
+    }
+
+    function render(timestamp, frame) {
+      if (frame) {
+        const hitTestResults = frame.getHitTestResults(hitTestSource);
+        if (hitTestResults.length > 0) {
+          const hit = hitTestResults[0];
+          const pose = hit.getPose(xrRefSpace);
+          reticle.visible = true;
+          reticle.matrix.fromArray(pose.transform.matrix);
+
+          if (points.length > 0) {
+            const currentPos = new THREE.Vector3();
+            currentPos.setFromMatrixPosition(reticle.matrix);
+            const dist = currentPos.distanceTo(points[points.length - 1]);
+            infoBox.innerText = `已記錄 ${points.length} 個牆角點 | 與上點距離: ${dist.toFixed(2)}m`;
+          }
+        } else {
+          reticle.visible = false;
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    addBtn.addEventListener('click', () => {
+      if (reticle && reticle.visible) {
+        const position = new THREE.Vector3();
+        position.setFromMatrixPosition(reticle.matrix);
+        points.push(position);
+
+        if (points.length === 1) addBtn.innerText = "紀錄下一個點";
+        if (points.length >= 3) pdfBtn.disabled = false;
+
+        update3DLines();
+      } else {
+        alert("未瞄準到地面！請對著地板擺動手機掃描。");
+      }
+    });
+
+    function update3DLines() {
+      if (linesMesh) scene.remove(linesMesh);
+      if (points.length < 2) return;
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(points);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 4 });
+      linesMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(linesMesh);
+    }
+
+    pdfBtn.addEventListener('click', generatePDF);
+
+    // ========== 生成 PDF、閉合多邊形、計算面積與最佳旋轉 ==========
+    function generatePDF() {
+      if (points.length < 3) return;
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      // 1. 轉為 2D 座標
+      let rawPoints = points.map(p => ({ x: p.x, y: p.z }));
+
+      // 2. 自動判斷最佳旋轉角度 (使圖形在 A4 上放至最大)
+      const getBounds = (pts) => {
+        const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        return { minX, maxX, minY, maxY, w: maxX - minX || 0.1, h: maxY - minY || 0.1 };
+      };
+
+      const margin = 20;
+      const pdfWidth = 170;  // 210 - 40
+      const pdfHeight = 207; // 297 - 90 (留空間給標題與底部面積數據)
+
+      let b0 = getBounds(rawPoints);
+      let s0 = Math.min(pdfWidth / b0.w, pdfHeight / b0.h);
+
+      let rotated = rawPoints.map(p => ({ x: -p.y, y: p.x }));
+      let b90 = getBounds(rotated);
+      let s90 = Math.min(pdfWidth / b90.w, pdfHeight / b90.h);
+
+      let finalPoints = (s90 > s0) ? rotated : rawPoints;
+      let finalBounds = (s90 > s0) ? b90 : b0;
+      let scale = (s90 > s0) ? s90 : s0;
+
+      const toPDFX = (x) => margin + (x - finalBounds.minX) * scale + (pdfWidth - finalBounds.w * scale) / 2;
+      const toPDFY = (y) => 55 + (y - finalBounds.minY) * scale + (pdfHeight - finalBounds.h * scale) / 2;
+
+      // 標題
+      doc.setFontSize(22);
+      doc.text("Floor Plan Layout", 105, 20, { align: "center" });
+
+      doc.setLineWidth(1.0);
+      doc.setDrawColor(0, 0, 0);
+
+      const totalPoints = finalPoints.length;
+      let totalPerimeter = 0;
+      let shoelaceSum = 0;
+
+      // 繪線並閉合多邊形
+      for (let i = 0; i < totalPoints; i++) {
+        const p1 = finalPoints[i];
+        const p2 = finalPoints[(i + 1) % totalPoints]; // (i + 1) % totalPoints 會自動將尾點連回首點
+
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+        doc.line(x1, y1, x2, y2);
+
+        const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+        totalPerimeter += dist;
+        shoelaceSum += (p1.x * p2.y) - (p2.x * p1.y);
+
+        const midX = (x1 + x2) / 2;
+        const midY = (y1 + y2) / 2;
+        doc.setFontSize(9);
+        doc.setTextColor(200, 0, 0);
+        doc.text(`${dist.toFixed(2)}m`, midX, midY - 2, { align: "center" });
+      }
+
+      // 3. 計算總面積與呎數
+      const areaM2 = Math.abs(shoelaceSum) / 2;
+      const areaSqFt = areaM2 * 10.7639;
+
+      // 4. 底部資訊欄（印出面積、呎數、總周長）
+      doc.setFontSize(11);
+      doc.setTextColor(0, 0, 0);
+      doc.setFillColor(245, 245, 245);
+      doc.rect(margin, 250, pdfWidth, 25, "F");
+
+      doc.text(`Total Area (總面積): ${areaM2.toFixed(2)} m² / ${areaSqFt.toFixed(1)} sq ft (平方呎)`, 25, 260);
+      doc.text(`Total Perimeter (總周長): ${totalPerimeter.toFixed(2)} m`, 25, 268);
+
+      doc.save("floor_plan_measured.pdf");
+    }
+  </script>
+</body>
+</html>
       box-shadow: 0 4px 12px rgba(0,0,0,0.4); cursor: pointer; text-align: center;
     }
 
