@@ -2,38 +2,391 @@
 <html lang="zh-HK">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>AR 天花板平面圖測量工具</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
       width: 100%; height: 100%; overflow: hidden;
-      background-color: #111; font-family: -apple-system, sans-serif;
+      background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
 
-    /* 頂層 AR DOM Overlay UI */
+    /* 頂層 AR UI 覆蓋層 */
     #overlay-ui {
-      position: fixed;
-      top: 0; left: 0; width: 100vw; height: 100vh;
+      position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       z-index: 9999;
       display: flex; flex-direction: column;
       justify-content: space-between; align-items: center;
       padding: 30px 20px;
+      pointer-events: none; /* 讓未點擊到的區域穿透到 WebXR */
     }
 
     #info-box {
       background: rgba(0, 0, 0, 0.85);
-      color: #fff;
-      padding: 15px 20px;
+      color: #ffffff;
+      padding: 16px 20px;
       border-radius: 16px;
       font-size: 14px;
+      line-height: 1.4;
       text-align: center;
       max-width: 90%;
       box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-      backdrop-filter: blur(4px);
-      word-break: break-all;
+      backdrop-filter: blur(6px);
       pointer-events: auto;
     }
+
+    #btn-container {
+      display: flex;
+      gap: 12px;
+      width: 100%;
+      max-width: 380px;
+      justify-content: center;
+      pointer-events: auto;
+    }
+
+    .action-btn {
+      flex: 1; padding: 15px 12px; font-size: 15px; font-weight: bold;
+      color: #ffffff; border: none; border-radius: 14px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4); cursor: pointer; text-align: center;
+      transition: all 0.2s ease;
+    }
+
+    /* 初始狀態：首頁只顯示開啟 AR */
+    #start-ar-btn { background-color: #007bff; width: 100%; max-width: 240px; }
+    
+    /* 進入 AR 後才顯示的按鈕 */
+    #add-point-btn { background-color: #28a745; display: none; }
+    #export-pdf-btn { background-color: #17a2b8; display: none; }
+    
+    .action-btn:disabled { background-color: #555555 !important; opacity: 0.5; cursor: not-allowed; }
+
+    /* 正中央紅色瞄準十字 */
+    #crosshair {
+      position: fixed; top: 50%; left: 50%;
+      width: 32px; height: 32px;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      display: none;
+      z-index: 9998;
+    }
+    #crosshair::before, #crosshair::after {
+      content: ''; position: absolute; background: #ff3b30;
+      box-shadow: 0 0 4px rgba(255, 255, 255, 0.8);
+    }
+    #crosshair::before { top: 15px; left: 0; width: 32px; height: 2px; }
+    #crosshair::after { top: 0; left: 15px; width: 2px; height: 32px; }
+    #crosshair-dot {
+      position: absolute; top: 13px; left: 13px; width: 6px; height: 6px;
+      background: #ff3b30; border-radius: 50%; border: 1px solid #ffffff;
+    }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- 正中央紅色瞄準十字 -->
+  <div id="crosshair"><div id="crosshair-dot"></div></div>
+
+  <div id="overlay-ui">
+    <div id="info-box">請按下方的「開啟 AR」按鈕開始測量天花</div>
+    
+    <div id="btn-container">
+      <!-- 1. 一開始只有這個按鈕 -->
+      <button id="start-ar-btn" class="action-btn">開啟 AR</button>
+      
+      <!-- 2. 開啟 AR 後才會顯示以下兩個按鈕 -->
+      <button id="add-point-btn" class="action-btn">加入新角位</button>
+      <button id="export-pdf-btn" class="action-btn" disabled>匯出 PDF (至少需3點)</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let points = [];
+    let lineMesh, currentTargetPos = null;
+    let target3DCrosshair;
+    let pointMarkersGroup = new THREE.Group();
+    let defaultCeilingDistance = 2.2; // 預設天花高度距離
+
+    const startArBtn = document.getElementById('start-ar-btn');
+    const addPointBtn = document.getElementById('add-point-btn');
+    const exportPdfBtn = document.getElementById('export-pdf-btn');
+    const infoBox = document.getElementById('info-box');
+    const overlayUI = document.getElementById('overlay-ui');
+    const crosshair = document.getElementById('crosshair');
+
+    function showStatus(msg, isError = false) {
+      infoBox.style.color = isError ? "#ff6b6b" : "#ffffff";
+      infoBox.innerText = msg;
+      if (isError) console.error(msg);
+    }
+
+    // 1. 環境檢查
+    window.addEventListener('load', async () => {
+      if (!window.isSecureContext) {
+        showStatus("錯誤：WebXR 要求必須在 HTTPS 安全連線下執行！", true);
+        startArBtn.disabled = true;
+        return;
+      }
+      if (!navigator.xr) {
+        showStatus("錯誤：此瀏覽器不支援 WebXR (請使用 Android 版 Chrome)", true);
+        startArBtn.disabled = true;
+        return;
+      }
+      try {
+        const isSupported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!isSupported) {
+          showStatus("錯誤：裝置不支援 AR 功能，請確認已安裝 Google Play Services for AR", true);
+          startArBtn.disabled = true;
+        }
+      } catch (e) {
+        showStatus("檢查 AR 支援失敗: " + e.message, true);
+      }
+    });
+
+    // 2. 按下「開啟 AR」請求權限並啟動 Session
+    startArBtn.addEventListener('click', async () => {
+      showStatus("正在請求相機與 AR 權限...");
+
+      try {
+        const sessionOptions = {
+          optionalFeatures: ['dom-overlay', 'hit-test', 'local-floor', 'local'],
+          domOverlay: { root: overlayUI }
+        };
+
+        const session = await navigator.xr.requestSession('immersive-ar', sessionOptions);
+        initARScene(session);
+      } catch (err) {
+        showStatus("開啟 AR 失敗: " + err.message, true);
+      }
+    });
+
+    // 3. 初始化 AR 場景與介面切換
+    async function initARScene(session) {
+      showStatus("AR 載入中...");
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      // 設定全透明背景，讓手機鏡頭畫面能透出來
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0x000000, 0); 
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+      scene.add(light);
+      scene.add(pointMarkersGroup);
+
+      target3DCrosshair = create3DCrosshair();
+      target3DCrosshair.visible = false;
+      scene.add(target3DCrosshair);
+
+      await renderer.xr.setSession(session);
+
+      // 介面切換：隱藏「開啟 AR」，顯示「加入新角位」與「匯出 PDF」
+      startArBtn.style.display = 'none';
+      addPointBtn.style.display = 'inline-block';
+      exportPdfBtn.style.display = 'inline-block';
+      crosshair.style.display = 'block';
+
+      showStatus("請用【紅色十字】對準第一個天花牆角，按「加入新角位」");
+
+      session.addEventListener('end', onSessionEnd);
+      renderer.setAnimationLoop(renderLoop);
+    }
+
+    function onSessionEnd() {
+      showStatus("AR 已關閉");
+      startArBtn.style.display = 'inline-block';
+      addPointBtn.style.display = 'none';
+      exportPdfBtn.style.display = 'none';
+      crosshair.style.display = 'none';
+      renderer.setAnimationLoop(null);
+    }
+
+    function create3DCrosshair() {
+      const group = new THREE.Group();
+      const mat = new THREE.LineBasicMaterial({ color: 0xff0000, linewidth: 3, depthTest: false });
+
+      const gX = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-0.06, 0, 0), new THREE.Vector3(0.06, 0, 0)]);
+      const gZ = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, -0.06), new THREE.Vector3(0, 0, 0.06)]);
+
+      const lX = new THREE.Line(gX, mat);
+      const lZ = new THREE.Line(gZ, mat);
+      lX.renderOrder = 999;
+      lZ.renderOrder = 999;
+
+      group.add(lX, lZ);
+      return group;
+    }
+
+    // 4. 即時計算光線投射與點位置
+    function renderLoop(timestamp, frame) {
+      if (frame) {
+        const camPos = new THREE.Vector3();
+        const camDir = new THREE.Vector3(0, 0, -1);
+
+        camera.getWorldPosition(camPos);
+        camDir.applyQuaternion(camera.quaternion).normalize();
+
+        if (points.length === 0) {
+          currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(defaultCeilingDistance));
+        } else {
+          const ceilingY = points[0].y;
+          if (Math.abs(camDir.y) > 0.01) {
+            const t = (ceilingY - camPos.y) / camDir.y;
+            if (t > 0) currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(t));
+          }
+        }
+
+        if (currentTargetPos) {
+          target3DCrosshair.position.copy(currentTargetPos);
+          target3DCrosshair.visible = true;
+
+          if (points.length > 0) {
+            const dist = currentTargetPos.distanceTo(points[points.length - 1]);
+            showStatus(`已記錄 ${points.length} 個牆角點 | 與上點距離: ${dist.toFixed(2)}m`);
+            updatePreviewLine(currentTargetPos);
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 5. 點擊「加入新角位」
+    addPointBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!currentTargetPos) return;
+
+      const newPt = currentTargetPos.clone();
+      points.push(newPt);
+
+      // 畫出角位標記點
+      const mGeo = new THREE.SphereGeometry(0.03, 16, 16);
+      const mMat = new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false });
+      const marker = new THREE.Mesh(mGeo, mMat);
+      marker.position.copy(newPt);
+      marker.renderOrder = 998;
+      pointMarkersGroup.add(marker);
+
+      if (points.length === 1) {
+        showStatus("已鎖定天花高度！請移動手機對準下一個牆角點");
+      } else if (points.length >= 3) {
+        exportPdfBtn.disabled = false;
+        exportPdfBtn.innerText = `匯出 PDF (${points.length}點)`;
+      }
+
+      updateSolidLines();
+    });
+
+    function updatePreviewLine(previewPos) {
+      if (points.length === 0) return;
+      draw3DLines([...points, previewPos]);
+    }
+
+    function updateSolidLines() {
+      if (points.length < 2) return;
+      draw3DLines(points);
+    }
+
+    function draw3DLines(ptsArray) {
+      if (lineMesh) scene.remove(lineMesh);
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(ptsArray);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 4, depthTest: false });
+      lineMesh = new THREE.Line(lineGeo, lineMat);
+      lineMesh.renderOrder = 997;
+      scene.add(lineMesh);
+    }
+
+    // 6. 匯出 Floorplan PDF 與面積計算
+    exportPdfBtn.addEventListener('click', () => {
+      if (points.length < 3) return;
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      // 取出 2D 平面座標 (X, Z)
+      let rawPoints = points.map(p => ({ x: p.x, y: p.z }));
+
+      const getBounds = (pts) => {
+        const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        return { minX, maxX, minY, maxY, w: maxX - minX || 0.1, h: maxY - minY || 0.1 };
+      };
+
+      const margin = 20;
+      const pdfWidth = 170;
+      const pdfHeight = 180;
+
+      let b0 = getBounds(rawPoints);
+      let s0 = Math.min(pdfWidth / b0.w, pdfHeight / b0.h);
+
+      let rotated = rawPoints.map(p => ({ x: -p.y, y: p.x }));
+      let b90 = getBounds(rotated);
+      let s90 = Math.min(pdfWidth / b90.w, pdfHeight / b90.h);
+
+      let finalPoints = (s90 > s0) ? rotated : rawPoints;
+      let finalBounds = (s90 > s0) ? b90 : b0;
+      let scale = (s90 > s0) ? s90 : s0;
+
+      const toPDFX = (x) => margin + (x - finalBounds.minX) * scale + (pdfWidth - finalBounds.w * scale) / 2;
+      const toPDFY = (y) => 35 + (y - finalBounds.minY) * scale + (pdfHeight - finalBounds.h * scale) / 2;
+
+      // PDF 標題
+      doc.setFontSize(20);
+      doc.text("Ceiling Floor Plan Layout", 105, 20, { align: "center" });
+
+      doc.setLineWidth(0.8);
+      doc.setDrawColor(0, 0, 0);
+
+      const totalPoints = finalPoints.length;
+      let totalPerimeter = 0;
+      let shoelaceSum = 0;
+
+      // 繪製牆面連線與計算長度
+      for (let i = 0; i < totalPoints; i++) {
+        const p1 = finalPoints[i];
+        const p2 = finalPoints[(i + 1) % totalPoints];
+
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+        doc.line(x1, y1, x2, y2);
+
+        const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+        totalPerimeter += dist;
+        shoelaceSum += (p1.x * p2.y) - (p2.x * p1.y);
+
+        const midX = (x1 + x2) / 2;
+        const midY = (y1 + y2) / 2;
+        doc.setFontSize(9);
+        doc.setTextColor(220, 0, 0);
+        doc.text(`${dist.toFixed(2)}m`, midX, midY - 2, { align: "center" });
+      }
+
+      // 鞋帶公式計算總面積
+      const areaM2 = Math.abs(shoelaceSum) / 2;
+      const areaSqFt = areaM2 * 10.7639;
+
+      // 輸出資訊框
+      doc.setFontSize(10);
+      doc.setTextColor(0, 0, 0);
+      doc.setFillColor(245, 245, 245);
+      doc.rect(margin, 245, pdfWidth, 25, "F");
+
+      doc.text(`Total Area (總面積): ${areaM2.toFixed(2)} m² / ${areaSqFt.toFixed(1)} sq ft`, 25, 255);
+      doc.text(`Total Perimeter (總周長): ${totalPerimeter.toFixed(2)} m`, 25, 263);
+
+      doc.save("ceiling_floorplan.pdf");
+    });
+  </script>
+</body>
+</html>
 
     #btn-container {
       display: flex;
