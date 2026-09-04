@@ -11,29 +11,306 @@
       background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
 
-    /* 三維渲染背景 Canvas 放在最底層 */
-    canvas {
-      position: absolute !important;
-      top: 0; left: 0;
-      width: 100% !important; height: 100% !important;
-      z-index: 1 !important;
+    /* 網頁未進入 AR 時的預設畫面 (全螢幕集中按鈕) */
+    #landing-screen {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 10;
+      display: flex; flex-direction: column; justify-content: center; align-items: center;
+      background: #111; color: #fff; padding: 20px;
     }
 
-    /* WebXR DOM 覆蓋層容器 (最上層) */
-    #overlay-ui {
+    /* 專供 AR 模式使用的透明 Overlay 容器 */
+    #ar-overlay {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-      z-index: 99999 !important;
-      display: flex; flex-direction: column;
-      justify-content: space-between; align-items: center;
+      z-index: 99999;
+      display: none; /* 預設隱藏，進入 AR 後才啟用 */
+      flex-direction: column; justify-content: space-between; align-items: center;
       padding: 40px 20px;
-      pointer-events: none; /* 透明區域穿透到 3D 場景 */
+      pointer-events: none; /* 關鍵：點擊穿透到 AR 畫面上 */
+      background: transparent !important;
     }
 
-    /* 上方狀態顯示框 */
+    /* 狀態提示框 */
     #info-box {
-      background: rgba(0, 0, 0, 0.85);
-      color: #ffffff;
-      padding: 14px 20px;
+      background: rgba(0, 0, 0, 0.75);
+      color: #ffffff; padding: 12px 20px; border-radius: 12px;
+      font-size: 15px; font-weight: bold; text-align: center;
+      max-width: 90%; pointer-events: auto;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* 底部按鈕區 */
+    #btn-container {
+      display: flex; gap: 12px; width: 100%; max-width: 400px;
+      justify-content: center; pointer-events: auto;
+    }
+
+    .action-btn {
+      flex: 1; padding: 16px 12px; font-size: 16px; font-weight: bold;
+      color: #ffffff; border: none; border-radius: 12px; cursor: pointer; text-align: center;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      pointer-events: auto;
+    }
+
+    #start-ar-btn { background-color: #007bff; width: 220px; max-width: 80%; }
+    #add-point-btn { background-color: #28a745; }
+    #export-pdf-btn { background-color: #17a2b8; }
+    .action-btn:disabled { background-color: #555555 !important; opacity: 0.5; }
+
+    /* 正中央準星 */
+    #crosshair {
+      position: fixed; top: 50%; left: 50%; width: 30px; height: 30px;
+      transform: translate(-50%, -50%); pointer-events: none; display: none; z-index: 99998;
+    }
+    #crosshair::before, #crosshair::after { content: ''; position: absolute; background: #ff3b30; }
+    #crosshair::before { top: 14px; left: 0; width: 30px; height: 2px; }
+    #crosshair::after { top: 0; left: 14px; width: 2px; height: 30px; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- 1. 未啟動 AR 時的入口介面 -->
+  <div id="landing-screen">
+    <h2 style="margin-bottom: 20px;">AR 天花板測量</h2>
+    <p id="landing-msg" style="margin-bottom: 30px; color: #aaa; text-align: center;">請按下下方按鈕開啟相機進行 AR 測量</p>
+    <button id="start-ar-btn" class="action-btn">開啟 AR</button>
+  </div>
+
+  <!-- 2. AR 專用透明覆蓋層 -->
+  <div id="ar-overlay">
+    <div id="info-box">正在初始化 AR...</div>
+    <div id="btn-container">
+      <button id="add-point-btn" class="action-btn">加入新角位</button>
+      <button id="export-pdf-btn" class="action-btn" disabled>匯出 PDF</button>
+    </div>
+  </div>
+
+  <!-- 3. 中央點圖標 -->
+  <div id="crosshair"></div>
+
+  <script>
+    let camera, scene, renderer;
+    let points = [];
+    let lineMesh, currentTargetPos = null;
+    let pointMarkersGroup = new THREE.Group();
+    let defaultCeilingDistance = 2.2;
+
+    const landingScreen = document.getElementById('landing-screen');
+    const landingMsg = document.getElementById('landing-msg');
+    const startArBtn = document.getElementById('start-ar-btn');
+    const arOverlay = document.getElementById('ar-overlay');
+    const addPointBtn = document.getElementById('add-point-btn');
+    const exportPdfBtn = document.getElementById('export-pdf-btn');
+    const infoBox = document.getElementById('info-box');
+    const crosshair = document.getElementById('crosshair');
+
+    function showStatus(msg, isError = false) {
+      infoBox.style.color = isError ? "#ff6b6b" : "#ffffff";
+      infoBox.innerText = msg;
+      if (isError) {
+        landingMsg.innerText = msg;
+        landingMsg.style.color = "#ff6b6b";
+      }
+    }
+
+    // 檢查瀏覽器條件
+    window.addEventListener('load', async () => {
+      if (!window.isSecureContext) {
+        showStatus("失敗：WebXR 要求必須在 HTTPS 安全網址（或 localhost）執行！", true);
+        startArBtn.disabled = true;
+        return;
+      }
+      if (!navigator.xr) {
+        showStatus("失敗：此瀏覽器不支援 WebXR (請使用 Android Chrome 瀏覽器)", true);
+        startArBtn.disabled = true;
+        return;
+      }
+
+      try {
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          showStatus("失敗：裝置不支援 AR 功能，請更新/安裝「Google Play Services for AR」", true);
+          startArBtn.disabled = true;
+        }
+      } catch (e) {
+        showStatus("環境檢查錯誤: " + e.message, true);
+      }
+    });
+
+    // 點擊開啟 AR
+    startArBtn.addEventListener('click', async () => {
+      // 1. 取得相機權限
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        stream.getTracks().forEach(track => track.stop());
+      } catch (err) {
+        alert("無法獲取相機權限，請確認瀏覽器已允許使用相機。");
+        return;
+      }
+
+      // 2. 請求 WebXR AR Session
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          optionalFeatures: ['dom-overlay', 'hit-test', 'local-floor', 'local'],
+          domOverlay: { root: arOverlay } // 綁定指定的 Overlay DOM
+        });
+
+        initARScene(session);
+      } catch (err) {
+        alert("無法啟動 AR: " + err.message);
+      }
+    });
+
+    async function initARScene(session) {
+      // 隱藏入口畫面，顯示 AR UI
+      landingScreen.style.display = 'none';
+      arOverlay.style.display = 'flex';
+      crosshair.style.display = 'block';
+
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0x000000, 0); // 設定完全透明背景
+      renderer.xr.enabled = true;
+
+      // 確保畫布置底
+      const canvas = renderer.domElement;
+      canvas.style.position = 'fixed';
+      canvas.style.top = '0';
+      canvas.style.left = '0';
+      canvas.style.width = '100vw';
+      canvas.style.height = '100vh';
+      canvas.style.zIndex = '1';
+      document.body.appendChild(canvas);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+      scene.add(pointMarkersGroup);
+
+      await renderer.xr.setSession(session);
+
+      showStatus("請用對準十字對準第一個牆角，按「加入新角位」");
+
+      session.addEventListener('end', onSessionEnd);
+      renderer.setAnimationLoop(renderLoop);
+    }
+
+    function onSessionEnd() {
+      landingScreen.style.display = 'flex';
+      arOverlay.style.display = 'none';
+      crosshair.style.display = 'none';
+      renderer.setAnimationLoop(null);
+    }
+
+    function renderLoop(timestamp, frame) {
+      if (frame) {
+        const camPos = new THREE.Vector3();
+        const camDir = new THREE.Vector3(0, 0, -1);
+        camera.getWorldPosition(camPos);
+        camDir.applyQuaternion(camera.quaternion).normalize();
+
+        if (points.length === 0) {
+          currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(defaultCeilingDistance));
+        } else {
+          const ceilingY = points[0].y;
+          if (Math.abs(camDir.y) > 0.01) {
+            const t = (ceilingY - camPos.y) / camDir.y;
+            if (t > 0) currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(t));
+          }
+        }
+
+        if (currentTargetPos && points.length > 0) {
+          const dist = currentTargetPos.distanceTo(points[points.length - 1]);
+          showStatus(`已記錄 ${points.length} 個點 | 當前長度: ${dist.toFixed(2)}m`);
+          updatePreviewLine(currentTargetPos);
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 加入點
+    addPointBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!currentTargetPos) return;
+
+      const newPt = currentTargetPos.clone();
+      points.push(newPt);
+
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.03, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false })
+      );
+      marker.position.copy(newPt);
+      pointMarkersGroup.add(marker);
+
+      if (points.length >= 3) {
+        exportPdfBtn.disabled = false;
+        exportPdfBtn.innerText = `匯出 PDF (${points.length}點)`;
+      }
+      updateSolidLines();
+    });
+
+    function updatePreviewLine(previewPos) { draw3DLines([...points, previewPos]); }
+    function updateSolidLines() { draw3DLines(points); }
+
+    function draw3DLines(ptsArray) {
+      if (lineMesh) scene.remove(lineMesh);
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(ptsArray);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 4, depthTest: false });
+      lineMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(lineMesh);
+    }
+
+    // 匯出 PDF
+    exportPdfBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (points.length < 3) return;
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      let rawPoints = points.map(p => ({ x: p.x, y: p.z }));
+      const xs = rawPoints.map(p => p.x), ys = rawPoints.map(p => p.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const w = maxX - minX || 0.1, h = maxY - minY || 0.1;
+
+      const scale = Math.min(160 / w, 160 / h);
+      const toPDFX = (x) => 25 + (x - minX) * scale;
+      const toPDFY = (y) => 40 + (y - minY) * scale;
+
+      doc.setFontSize(16);
+      doc.text("CEILING FLOOR PLAN", 105, 20, { align: "center" });
+
+      doc.setLineWidth(0.8);
+      let totalPerimeter = 0;
+      let shoelaceSum = 0;
+
+      for (let i = 0; i < rawPoints.length; i++) {
+        const p1 = rawPoints[i], p2 = rawPoints[(i + 1) % rawPoints.length];
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+
+        doc.line(x1, y1, x2, y2);
+        const dist = Math.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2);
+        totalPerimeter += dist;
+        shoelaceSum += (p1.x * p2.y) - (p2.x * p1.y);
+      }
+
+      const areaM2 = Math.abs(shoelaceSum) / 2;
+      doc.setFontSize(10);
+      doc.text(`Total Area: ${areaM2.toFixed(2)} m²`, 25, 240);
+      doc.text(`Total Perimeter: ${totalPerimeter.toFixed(2)} m`, 25, 248);
+
+      doc.save("Ceiling_Plan.pdf");
+    });
+  </script>
+</body>
+</html>
       border-radius: 14px;
       font-size: 15px;
       font-weight: 500;
