@@ -58,6 +58,305 @@
       cursor: pointer;
     }
 
+    #crosshair {
+      position: fixed;
+      top: 50%; left: 50%;
+      width: 16px; height: 16px;
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      display: none;
+      z-index: 9998;
+    }
+    #crosshair::before, #crosshair::after {
+      content: ''; position: absolute; background: #00ff00;
+    }
+    #crosshair::before { top: 7px; left: 0; width: 16px; height: 2px; }
+    #crosshair::after { top: 0; left: 7px; width: 2px; height: 16px; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <div id="crosshair"></div>
+
+  <div id="ui-layer">
+    <div id="status-card" class="interactive">請點擊下方藍色按鈕開啟 AR</div>
+    <button id="start-btn" class="interactive">開啟 AR (測量天花)</button>
+    <button id="pdf-btn" class="interactive">匯出 PDF (至少需3點)</button>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let xrRefSpace;
+    let points = [];
+    let lineMesh, currentTargetPos = null;
+    let pointerMesh; // 天花板上的紅點瞄準器
+    let pointMarkersGroup = new THREE.Group(); // 儲存已記錄點的黃色小球
+    let targetDistance = 2.2; // 預設距離 (米)
+
+    const startBtn = document.getElementById('start-btn');
+    const pdfBtn = document.getElementById('pdf-btn');
+    const statusCard = document.getElementById('status-card');
+    const crosshair = document.getElementById('crosshair');
+
+    startBtn.addEventListener('click', () => {
+      if (!window.isSecureContext) {
+        alert("錯誤：網址必須是 HTTPS");
+        return;
+      }
+      if (!navigator.xr) {
+        alert("錯誤：此瀏覽器不支援 WebXR AR！");
+        return;
+      }
+      requestAR();
+    });
+
+    async function requestAR() {
+      try {
+        statusCard.innerText = "正在啟動相機...";
+
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+        scene.add(light);
+        scene.add(pointMarkersGroup);
+
+        // 創建一個亮紅色的 3D 小球作為天花板上的即時瞄準點
+        const pGeo = new THREE.SphereGeometry(0.04, 16, 16);
+        const pMat = new THREE.MeshBasicMaterial({ color: 0xff0000, depthTest: false });
+        pointerMesh = new THREE.Mesh(pGeo, pMat);
+        pointerMesh.renderOrder = 999;
+        pointerMesh.visible = false;
+        scene.add(pointerMesh);
+
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['local-floor']
+        });
+
+        renderer.xr.setSession(session);
+
+        startBtn.style.display = 'none';
+        pdfBtn.style.display = 'inline-block';
+        crosshair.style.display = 'block';
+        statusCard.innerText = "對準第一個天花板角落（會出現紅點），【點擊螢幕】記錄第一點。";
+
+        session.addEventListener('select', onSelect);
+
+        xrRefSpace = await session.requestReferenceSpace('local-floor');
+        renderer.setAnimationLoop(render);
+
+      } catch (err) {
+        alert("AR 啟動失敗：\n" + err.message);
+        statusCard.innerText = "啟動失敗: " + err.message;
+      }
+    }
+
+    function render(timestamp, frame) {
+      if (frame) {
+        const camPos = new THREE.Vector3();
+        const camDir = new THREE.Vector3();
+        camera.getWorldPosition(camPos);
+        camera.getWorldDirection(camDir);
+
+        if (points.length === 0) {
+          // 還沒下記錄點時：推算鏡頭前方預設距離的天花板位置
+          currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(targetDistance));
+        } else {
+          // 已記錄第一個點：計算鏡頭視線與天花板平面 (Y = points[0].y) 的精確交點
+          const ceilingY = points[0].y;
+          if (camDir.y !== 0) {
+            const t = (ceilingY - camPos.y) / camDir.y;
+            if (t > 0) {
+              currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(t));
+            }
+          }
+        }
+
+        // 移動紅點到天花板瞄準位置
+        if (currentTargetPos) {
+          pointerMesh.position.copy(currentTargetPos);
+          pointerMesh.visible = true;
+
+          if (points.length > 0) {
+            const dist = currentTargetPos.distanceTo(points[points.length - 1]);
+            statusCard.innerText = `已記錄 ${points.length} 個角點 | 距上點: ${dist.toFixed(2)}m (點擊記錄)`;
+            updateDynamicLine(currentTargetPos);
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 當點擊螢幕記錄點時
+    function onSelect() {
+      if (currentTargetPos) {
+        const recordedPoint = currentTargetPos.clone();
+        points.push(recordedPoint);
+
+        // 於記錄位置加入黃色小球做標記
+        const mGeo = new THREE.SphereGeometry(0.03, 16, 16);
+        const mMat = new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false });
+        const marker = new THREE.Mesh(mGeo, mMat);
+        marker.position.copy(recordedPoint);
+        marker.renderOrder = 998;
+        pointMarkersGroup.add(marker);
+
+        if (points.length === 1) {
+          statusCard.innerText = "已鎖定天花板高度！請移動相機對準下一個天花角落。";
+        }
+
+        if (points.length >= 3) {
+          pdfBtn.innerText = `匯出 PDF (已記 ${points.length} 點)`;
+        }
+
+        update3DLines();
+      }
+    }
+
+    // 動態繪製與當前瞄準點之間的實時輔助線
+    function updateDynamicLine(previewPos) {
+      if (points.length === 0) return;
+      const pts = [...points, previewPos];
+      drawLines(pts);
+    }
+
+    // 更新固定的已記錄連線
+    function update3DLines() {
+      if (points.length < 2) return;
+      drawLines(points);
+    }
+
+    function drawLines(ptsArray) {
+      if (lineMesh) scene.remove(lineMesh);
+
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(ptsArray);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x00ff00,
+        linewidth: 5,
+        depthTest: false // 強制線條浮在最前面，不被實體遮擋
+      });
+      lineMesh = new THREE.Line(lineGeo, lineMat);
+      lineMesh.renderOrder = 997;
+      scene.add(lineMesh);
+    }
+
+    // 匯出 PDF
+    pdfBtn.addEventListener('click', generatePDF);
+
+    function generatePDF() {
+      if (points.length < 3) {
+        alert("請至少記錄 3 個角點再匯出 PDF！");
+        return;
+      }
+
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      let rawPoints = points.map(p => ({ x: p.x, y: p.z }));
+
+      const getBounds = (pts) => {
+        const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs);
+        const minY = Math.min(...ys), maxY = Math.max(...ys);
+        return { minX, maxX, minY, maxY, w: maxX - minX || 0.1, h: maxY - minY || 0.1 };
+      };
+
+      const margin = 20;
+      const pdfWidth = 170;
+      const pdfHeight = 180;
+
+      let b0 = getBounds(rawPoints);
+      let s0 = Math.min(pdfWidth / b0.w, pdfHeight / b0.h);
+
+      let rotated = rawPoints.map(p => ({ x: -p.y, y: p.x }));
+      let b90 = getBounds(rotated);
+      let s90 = Math.min(pdfWidth / b90.w, pdfHeight / b90.h);
+
+      let finalPoints = (s90 > s0) ? rotated : rawPoints;
+      let finalBounds = (s90 > s0) ? b90 : b0;
+      let scale = (s90 > s0) ? s90 : s0;
+
+      const toPDFX = (x) => margin + (x - finalBounds.minX) * scale + (pdfWidth - finalBounds.w * scale) / 2;
+      const toPDFY = (y) => 35 + (y - finalBounds.minY) * scale + (pdfHeight - finalBounds.h * scale) / 2;
+
+      doc.setFontSize(22);
+      doc.text("Ceiling / Floor Plan Layout", 105, 20, { align: "center" });
+
+      doc.setLineWidth(1.0);
+      doc.setDrawColor(0, 0, 0);
+
+      const totalPoints = finalPoints.length;
+      let totalPerimeter = 0;
+      let shoelaceSum = 0;
+
+      for (let i = 0; i < totalPoints; i++) {
+        const p1 = finalPoints[i];
+        const p2 = finalPoints[(i + 1) % totalPoints];
+
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+        doc.line(x1, y1, x2, y2);
+
+        const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+        totalPerimeter += dist;
+        shoelaceSum += (p1.x * p2.y) - (p2.x * p1.y);
+
+        const midX = (x1 + x2) / 2;
+        const midY = (y1 + y2) / 2;
+        doc.setFontSize(9);
+        doc.setTextColor(200, 0, 0);
+        doc.text(`${dist.toFixed(2)}m`, midX, midY - 2, { align: "center" });
+      }
+
+      const areaM2 = Math.abs(shoelaceSum) / 2;
+      const areaSqFt = areaM2 * 10.7639;
+
+      doc.setFontSize(11);
+      doc.setTextColor(0, 0, 0);
+      doc.setFillColor(245, 245, 245);
+      doc.rect(margin, 245, pdfWidth, 25, "F");
+
+      doc.text(`Total Area (總面積): ${areaM2.toFixed(2)} m² / ${areaSqFt.toFixed(1)} sq ft (平方呎)`, 25, 255);
+      doc.text(`Total Perimeter (總周長): ${totalPerimeter.toFixed(2)} m`, 25, 263);
+
+      doc.save("ceiling_floor_plan.pdf");
+    }
+  </script>
+</body>
+</html>
+    #start-btn {
+      background: #007bff;
+      color: #fff;
+      font-size: 18px;
+      font-weight: bold;
+      border: none;
+      padding: 16px 32px;
+      border-radius: 30px;
+      box-shadow: 0 4px 15px rgba(0,123,255,0.4);
+      cursor: pointer;
+    }
+
+    #pdf-btn {
+      background: #17a2b8;
+      color: #fff;
+      font-size: 16px;
+      font-weight: bold;
+      border: none;
+      padding: 14px 28px;
+      border-radius: 25px;
+      display: none;
+      cursor: pointer;
+    }
+
     /* 螢幕正中央十字瞄準線 */
     #crosshair {
       position: fixed;
