@@ -11,29 +11,285 @@
       background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
 
-    /* 頂層 AR UI 覆蓋層 */
+    /* WebXR DOM 覆蓋層 */
     #overlay-ui {
       position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
       z-index: 9999;
       display: flex; flex-direction: column;
       justify-content: space-between; align-items: center;
       padding: 30px 20px;
-      pointer-events: none; /* 讓未點擊到的區域穿透到 WebXR */
+      pointer-events: none; /* 穿透點擊到 AR 場景 */
     }
 
     #info-box {
       background: rgba(0, 0, 0, 0.85);
       color: #ffffff;
-      padding: 16px 20px;
-      border-radius: 16px;
+      padding: 14px 18px;
+      border-radius: 14px;
       font-size: 14px;
-      line-height: 1.4;
       text-align: center;
       max-width: 90%;
       box-shadow: 0 4px 12px rgba(0,0,0,0.5);
       backdrop-filter: blur(6px);
       pointer-events: auto;
     }
+
+    #btn-container {
+      display: flex; gap: 10px; width: 100%; max-width: 400px;
+      justify-content: center; pointer-events: auto;
+    }
+
+    .action-btn {
+      flex: 1; padding: 14px 10px; font-size: 15px; font-weight: bold;
+      color: #ffffff; border: none; border-radius: 12px; cursor: pointer; text-align: center;
+    }
+
+    #start-ar-btn { background-color: #007bff; width: 100%; max-width: 240px; }
+    #add-point-btn { background-color: #28a745; display: none; }
+    #export-pdf-btn { background-color: #17a2b8; display: none; }
+    .action-btn:disabled { background-color: #555555 !important; opacity: 0.5; cursor: not-allowed; }
+
+    /* 正中央瞄準十字 */
+    #crosshair {
+      position: fixed; top: 50%; left: 50%; width: 32px; height: 32px;
+      transform: translate(-50%, -50%); pointer-events: none; display: none; z-index: 9998;
+    }
+    #crosshair::before, #crosshair::after { content: ''; position: absolute; background: #ff3b30; }
+    #crosshair::before { top: 15px; left: 0; width: 32px; height: 2px; }
+    #crosshair::after { top: 0; left: 15px; width: 2px; height: 32px; }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+<body>
+
+  <div id="crosshair"></div>
+
+  <div id="overlay-ui">
+    <div id="info-box">請按下方的「開啟 AR」按鈕開始測量</div>
+    <div id="btn-container">
+      <button id="start-ar-btn" class="action-btn">開啟 AR</button>
+      <button id="add-point-btn" class="action-btn">加入新角位</button>
+      <button id="export-pdf-btn" class="action-btn" disabled>匯出工程 PDF</button>
+    </div>
+  </div>
+
+  <script>
+    let camera, scene, renderer;
+    let points = [];
+    let lineMesh, currentTargetPos = null;
+    let pointMarkersGroup = new THREE.Group();
+    let defaultCeilingDistance = 2.2;
+
+    const startArBtn = document.getElementById('start-ar-btn');
+    const addPointBtn = document.getElementById('add-point-btn');
+    const exportPdfBtn = document.getElementById('export-pdf-btn');
+    const infoBox = document.getElementById('info-box');
+    const overlayUI = document.getElementById('overlay-ui');
+    const crosshair = document.getElementById('crosshair');
+
+    function showStatus(msg, isError = false) {
+      infoBox.style.color = isError ? "#ff6b6b" : "#ffffff";
+      infoBox.innerText = msg;
+      if (isError) console.error(msg);
+    }
+
+    // 1. 檢查頁面環境
+    window.addEventListener('load', async () => {
+      if (!window.isSecureContext) {
+        showStatus("失敗：WebXR 要求必須在 HTTPS 安全網址（或 localhost）執行！", true);
+        startArBtn.disabled = true;
+        return;
+      }
+      if (!navigator.xr) {
+        showStatus("失敗：此瀏覽器不支援 WebXR (請使用 Android Chrome 瀏覽器)", true);
+        startArBtn.disabled = true;
+        return;
+      }
+
+      try {
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          showStatus("失敗：裝置不支援 AR 功能，請安裝/更新「Google Play Services for AR」", true);
+          startArBtn.disabled = true;
+        }
+      } catch (e) {
+        showStatus("環境檢查錯誤: " + e.message, true);
+      }
+    });
+
+    // 2. 按下「開啟 AR」：必須保持在事件主體中啟動 Session
+    startArBtn.addEventListener('click', async () => {
+      showStatus("正在開啟 AR 與請求相機權限...");
+
+      // 先向手機請求相機權限，避免 WebXR 因權限未獲授權而卡死
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // 取得權限後關閉臨時流
+        stream.getTracks().forEach(track => track.stop());
+      } catch (e) {
+        alert("必須授權相機權限才能開啟 AR！");
+        showStatus("相機權限被拒絕", true);
+        return;
+      }
+
+      // 啟動 WebXR Session
+      try {
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          optionalFeatures: ['dom-overlay', 'hit-test', 'local-floor', 'local'],
+          domOverlay: { root: overlayUI }
+        });
+        
+        initARScene(session);
+      } catch (err) {
+        alert("無法開啟 AR Session: " + err.message);
+        showStatus("開啟 AR 失敗: " + err.message, true);
+      }
+    });
+
+    // 3. 初始化 Three.js 與 WebXR Session
+    async function initARScene(session) {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setClearColor(0x000000, 0);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+      scene.add(pointMarkersGroup);
+
+      await renderer.xr.setSession(session);
+
+      // UI 切換
+      startArBtn.style.display = 'none';
+      addPointBtn.style.display = 'inline-block';
+      exportPdfBtn.style.display = 'inline-block';
+      crosshair.style.display = 'block';
+
+      showStatus("已成功開啟 AR！請用【紅色十字】對準第一個牆角，按「加入新角位」");
+
+      session.addEventListener('end', onSessionEnd);
+      renderer.setAnimationLoop(renderLoop);
+    }
+
+    function onSessionEnd() {
+      showStatus("AR 已關閉");
+      startArBtn.style.display = 'inline-block';
+      addPointBtn.style.display = 'none';
+      exportPdfBtn.style.display = 'none';
+      crosshair.style.display = 'none';
+      renderer.setAnimationLoop(null);
+    }
+
+    // 4. 即時渲染循環與瞄準射線計算
+    function renderLoop(timestamp, frame) {
+      if (frame) {
+        const camPos = new THREE.Vector3();
+        const camDir = new THREE.Vector3(0, 0, -1);
+        camera.getWorldPosition(camPos);
+        camDir.applyQuaternion(camera.quaternion).normalize();
+
+        if (points.length === 0) {
+          currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(defaultCeilingDistance));
+        } else {
+          const ceilingY = points[0].y;
+          if (Math.abs(camDir.y) > 0.01) {
+            const t = (ceilingY - camPos.y) / camDir.y;
+            if (t > 0) currentTargetPos = camPos.clone().add(camDir.clone().multiplyScalar(t));
+          }
+        }
+
+        if (currentTargetPos && points.length > 0) {
+          const dist = currentTargetPos.distanceTo(points[points.length - 1]);
+          showStatus(`已記錄 ${points.length} 個牆角 | 當前牆面長度: ${dist.toFixed(2)}m`);
+          updatePreviewLine(currentTargetPos);
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    // 5. 新增角位
+    addPointBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (!currentTargetPos) return;
+
+      const newPt = currentTargetPos.clone();
+      points.push(newPt);
+
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.03, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffff00, depthTest: false })
+      );
+      marker.position.copy(newPt);
+      pointMarkersGroup.add(marker);
+
+      if (points.length >= 3) {
+        exportPdfBtn.disabled = false;
+        exportPdfBtn.innerText = `匯出 PDF (${points.length}點)`;
+      }
+      updateSolidLines();
+    });
+
+    function updatePreviewLine(previewPos) { draw3DLines([...points, previewPos]); }
+    function updateSolidLines() { draw3DLines(points); }
+
+    function draw3DLines(ptsArray) {
+      if (lineMesh) scene.remove(lineMesh);
+      const lineGeo = new THREE.BufferGeometry().setFromPoints(ptsArray);
+      const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 4, depthTest: false });
+      lineMesh = new THREE.Line(lineGeo, lineMat);
+      scene.add(lineMesh);
+    }
+
+    // 6. 匯出 PDF
+    exportPdfBtn.addEventListener('click', () => {
+      if (points.length < 3) return;
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+      let rawPoints = points.map(p => ({ x: p.x, y: p.z }));
+      const xs = rawPoints.map(p => p.x), ys = rawPoints.map(p => p.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const w = maxX - minX || 0.1, h = maxY - minY || 0.1;
+
+      const scale = Math.min(160 / w, 160 / h);
+      const toPDFX = (x) => 25 + (x - minX) * scale;
+      const toPDFY = (y) => 40 + (y - minY) * scale;
+
+      doc.setFontSize(16);
+      doc.text("CEILING FLOOR PLAN", 105, 20, { align: "center" });
+
+      doc.setLineWidth(0.8);
+      let totalPerimeter = 0;
+      let shoelaceSum = 0;
+
+      for (let i = 0; i < rawPoints.length; i++) {
+        const p1 = rawPoints[i], p2 = rawPoints[(i + 1) % rawPoints.length];
+        const x1 = toPDFX(p1.x), y1 = toPDFY(p1.y);
+        const x2 = toPDFX(p2.x), y2 = toPDFY(p2.y);
+
+        doc.line(x1, y1, x2, y2);
+        const dist = Math.sqrt((p2.x - p1.x)**2 + (p2.y - p1.y)**2);
+        totalPerimeter += dist;
+        shoelaceSum += (p1.x * p2.y) - (p2.x * p1.y);
+      }
+
+      const areaM2 = Math.abs(shoelaceSum) / 2;
+      doc.setFontSize(10);
+      doc.text(`Total Area: ${areaM2.toFixed(2)} m²`, 25, 240);
+      doc.text(`Total Perimeter: ${totalPerimeter.toFixed(2)} m`, 25, 248);
+
+      doc.save("Ceiling_Plan.pdf");
+    });
+  </script>
+</body>
+</html>
 
     #btn-container {
       display: flex;
